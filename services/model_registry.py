@@ -55,10 +55,20 @@ class ModelRegistry:
 def _load_model(name: str) -> FaceModel:
     log.info("Loading %s (det_size=%s, ctx=cpu)...", name, DET_SIZE)
     started = time.time()
-    model = insightface.app.FaceAnalysis(
-        name=name,
-        allowed_modules=["detection", "recognition"],
-    )
+    try:
+        model = insightface.app.FaceAnalysis(
+            name=name,
+            allowed_modules=["detection", "recognition"],
+        )
+    except AssertionError:
+        # antelopev2.zip extracts into a nested directory that hides the
+        # detection model from InsightFace's loader. Flatten and retry once.
+        log.warning("%s failed to load (likely nested extraction); repairing and retrying", name)
+        fix_antelopev2_nesting()
+        model = insightface.app.FaceAnalysis(
+            name=name,
+            allowed_modules=["detection", "recognition"],
+        )
     model.prepare(ctx_id=CTX_CPU, det_size=DET_SIZE)
     log.info("%s ready in %.1fs", name, time.time() - started)
     return model
