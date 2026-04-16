@@ -2,8 +2,10 @@
 
 import Image from "next/image";
 import { useRef } from "react";
+import { AttentionPanel } from "@/components/AttentionPanel";
 import { BackendBadge } from "@/components/BackendBadge";
 import { ModelCard } from "@/components/ModelCard";
+import { useAttentionTracking } from "@/hooks/useAttentionTracking";
 import { useBackendHealth } from "@/hooks/useBackendHealth";
 import { useDetectionOverlay } from "@/hooks/useDetectionOverlay";
 import { useFaceModels } from "@/hooks/useFaceModels";
@@ -30,6 +32,11 @@ export default function FaceComparison() {
   });
 
   useDetectionOverlay({ videoRef, canvasRef: overlayRef, detection: live.detection });
+
+  const attention = useAttentionTracking({
+    videoRef,
+    enabled: models.loaded && webcam.ready,
+  });
 
   if (models.error) {
     return (
@@ -68,6 +75,15 @@ export default function FaceComparison() {
           snapSize={live.snapSize}
         />
       </div>
+
+      <AttentionPanel
+        attention={attention.state}
+        ready={attention.ready}
+        error={attention.error}
+        phase={attention.phase}
+        baseline={attention.baseline}
+        onRecalibrate={attention.recalibrate}
+      />
 
       <AlignedFacesPanel profile={profile.aligned} live={live.aligned} />
 

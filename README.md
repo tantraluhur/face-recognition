@@ -2,7 +2,10 @@
 
 A browser-based face comparison app built with Next.js, TypeScript, Tailwind CSS, and ONNX Runtime. Upload a profile photo, open the webcam, and see real-time match results.
 
-The project also ships an **optional Python backend** (FastAPI + InsightFace) that runs bigger models so you can compare accuracy side-by-side.
+The project also ships:
+
+- An **optional Python backend** (FastAPI + InsightFace) that runs bigger models so you can compare accuracy side-by-side.
+- A client-side **attention tracking** pipeline (MediaPipe Face Landmarker) for head pose + gaze + eyes-closed detection — useful for proctoring or liveness hints.
 
 ---
 
@@ -12,13 +15,14 @@ The project also ships an **optional Python backend** (FastAPI + InsightFace) th
 2. [Architecture](#architecture)
 3. [Project Structure](#project-structure)
 4. [How It Works](#how-it-works)
-5. [API Reference](#api-reference)
-6. [Configuration](#configuration)
-7. [Performance](#performance)
-8. [Troubleshooting](#troubleshooting)
-9. [Frontend vs Backend](#frontend-vs-backend)
-10. [Knowledge Base](#knowledge-base) — deep dive into models, benchmarks, and concepts
-11. [Glossary](#glossary)
+5. [Attention Tracking](#attention-tracking) — head pose, gaze, eyes state
+6. [API Reference](#api-reference)
+7. [Configuration](#configuration)
+8. [Performance](#performance)
+9. [Troubleshooting](#troubleshooting)
+10. [Frontend vs Backend](#frontend-vs-backend)
+11. [Knowledge Base](#knowledge-base) — deep dive into models, benchmarks, and concepts
+12. [Glossary](#glossary)
 
 ---
 
@@ -59,36 +63,44 @@ Refresh the frontend — the badge at the top flips to "Backend: online" and the
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│                          BROWSER                                  │
-│                                                                   │
-│   1. Detect face with SCRFD-500M       (frontend, 2.4 MB)         │
-│   2. Align face with 5 landmarks       (frontend, JS)             │
-│   3. Embed with MobileFaceNet          (frontend, 13 MB)          │
-│   4. Snapshot webcam frame as JPEG                                │
-│   5. Send both images to Python backend ──────────────────┐       │
-│                                                           │       │
-└───────────────────────────────────────────────────────────│───────┘
-                                                            │
-                                                            ▼
-┌──────────────────────────────────────────────────────────────────┐
-│                    PYTHON BACKEND (optional)                      │
-│                    FastAPI + InsightFace                          │
-│                                                                   │
-│   buffalo_l:    SCRFD-10G → align → ResNet50  ArcFace → 512-dim   │
-│   antelopev2:   SCRFD-10G → align → ResNet100 ArcFace → 512-dim   │
-│                                                                   │
-│   Both models run concurrently (asyncio.gather).                  │
-└──────────────────────────────────────────────────────────────────┘
-                                                            │
-                                                            ▼
-┌──────────────────────────────────────────────────────────────────┐
-│   UI shows three cards side-by-side:                              │
-│   [Frontend MobileFaceNet] [Backend buffalo_l] [Backend antelopev2]│
-└──────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────┐
+│                              BROWSER                                    │
+│                                                                         │
+│   ── Identity pipeline ────────────────────────────────────────         │
+│   1. Detect face with SCRFD-500M          (onnxruntime-web, 2.4 MB)     │
+│   2. Align with 5 landmarks               (JS similarity transform)     │
+│   3. Embed with MobileFaceNet             (onnxruntime-web, 13 MB)      │
+│   4. Snapshot webcam frame → JPEG                                       │
+│   5. POST both images to Python backend ─────────────────┐              │
+│                                                          │              │
+│   ── Attention pipeline (runs in parallel) ────────────  │              │
+│   a. MediaPipe Face Landmarker            (WASM, ~5 MB)  │              │
+│   b. Read 4×4 transformation matrix → yaw/pitch/roll     │              │
+│   c. Read eyeLook* blendshapes → 2D gaze vector          │              │
+│   d. Read eyeBlink* blendshapes → eyes open/closed       │              │
+│                                                          │              │
+└──────────────────────────────────────────────────────────│──────────────┘
+                                                           │
+                                                           ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│                      PYTHON BACKEND (optional)                          │
+│                      FastAPI + InsightFace                              │
+│                                                                         │
+│   buffalo_l:    SCRFD-10G → align → ResNet50  ArcFace → 512-dim         │
+│   antelopev2:   SCRFD-10G → align → ResNet100 ArcFace → 512-dim         │
+│                                                                         │
+│   Both models run concurrently (asyncio.gather).                        │
+└────────────────────────────────────────────────────────────────────────┘
+                                                           │
+                                                           ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│   UI panels:                                                            │
+│   • Model Comparison — MobileFaceNet vs buffalo_l vs antelopev2         │
+│   • Attention Tracking — status pill + head pose + gaze + eyes state    │
+└────────────────────────────────────────────────────────────────────────┘
 ```
 
-The backend is optional; if it's offline, the UI just marks those cards "Backend offline" and the frontend pipeline keeps running.
+The backend is optional; if it's offline, the UI just marks those cards "Backend offline" and the frontend pipeline keeps running. Attention tracking is pure-frontend — it never talks to the backend.
 
 ### Model lineup
 
@@ -116,23 +128,28 @@ src/
     FaceComparison.tsx              Orchestrator (composes hooks + sub-components)
     BackendBadge.tsx                Status pill (checking / online / offline)
     ModelCard.tsx                   Per-model similarity/status card
+    AttentionPanel.tsx              Status pill + head-pose / gaze / eyes cards
   hooks/
-    useFaceModels.ts                Loads ONNX models once
+    useFaceModels.ts                Loads ONNX identity models once
     useBackendHealth.ts             Polls /api/health; exposes status
     useWebcamStream.ts              Acquires and tears down MediaStream
     useDetectionOverlay.ts          Draws box + landmarks on canvas
     useProfileUpload.ts             Reads/resizes uploaded image, extracts embedding
     useLiveDetection.ts             Periodic detect → embed → compare → call backend
+    useAttentionTracking.ts         Shared FaceLandmarker; calibration + 4 FPS ticker
   lib/
     config.ts                       Shared constants (threshold, intervals, BACKEND_URL)
     faceApi.ts                      ONNX inference: detect / align / embed
     backend.ts                      Typed HTTP client for the Python backend
+    attention.ts                    Pure math: pose matrix → angles, blendshapes → gaze, baseline calibration
 
 public/
   models/
     det_500m.onnx                   SCRFD face detector (2.4 MB)
     w600k_mbf.onnx                  MobileFaceNet ArcFace embedder (13 MB)
 ```
+
+The Face Landmarker model (`face_landmarker.task`, ~3.8 MB) is fetched at runtime from Google's CDN — it doesn't live in `public/`.
 
 ### Backend (`python/`)
 
@@ -200,6 +217,240 @@ Typical differences by tier when comparing a photo to a live webcam:
 | Backend antelopev2 (ResNet100)| 60–70 %    | 2–15 %           |
 
 The important metric isn't the absolute similarity — it's the **gap** between same-person and different-person scores. Bigger models give wider gaps and therefore more reliable matching.
+
+---
+
+## Attention Tracking
+
+Runs entirely in the browser, in parallel with the identity pipeline. Purpose: tell whether the user is actually looking at the screen.
+
+### What it detects
+
+| Signal          | Source                                                        | Used for                                             |
+| --------------- | ------------------------------------------------------------- | ---------------------------------------------------- |
+| **Head pose**   | 4×4 transformation matrix from MediaPipe → yaw / pitch / roll | Is the head turned away from the screen?             |
+| **Gaze**        | `eyeLookIn/Out/Up/DownLeft/Right` blendshapes                 | Are the eyes looking off-screen while head is still? |
+| **Eyes closed** | `eyeBlinkLeft/Right` blendshapes (averaged)                   | Are the eyes shut? (blink / drowsy)                  |
+
+The UI reduces these into a single status: **on-screen**, **looking-away**, **eyes-closed**, or **no-face**.
+
+### Concepts: yaw, pitch, roll, gaze
+
+Think of your head as a tiny airplane. It can rotate three ways:
+
+```
+                 ↑  PITCH (look up/down)
+                 │     "nodding yes"
+                 │
+        ←────────┼────────→  YAW (turn left/right)
+                 │           "shaking no"
+                 │
+                 ↓
+             ROLL (tilt shoulder to shoulder)
+           "leaning ear toward shoulder"
+```
+
+| Angle     | Axis it rotates around | What it feels like            | Sign convention                          |
+| --------- | ---------------------- | ----------------------------- | ---------------------------------------- |
+| **Yaw**   | Vertical (Y)           | Shaking your head "no"        | +° = looking right, −° = looking left    |
+| **Pitch** | Horizontal (X)         | Nodding "yes"                 | +° = looking up,    −° = looking down    |
+| **Roll**  | Forward/back (Z)       | Tilting ear toward shoulder   | +° = tilting right, −° = tilting left    |
+
+Yaw 0° / pitch 0° / roll 0° means the head is pointing dead-straight at the camera.
+
+**Gaze** is a separate thing. Head pose tells you where the **head** is pointing; gaze tells you where the **eyes** are pointing inside the head. They can disagree — head facing you, eyes darting to a phone in your lap. We represent gaze as a 2D vector `(x, y)` in `[-1, 1]²`:
+
+```
+                   y = +1  (eyes looking up)
+                      ↑
+                      │
+      x = −1  ────────┼────────  x = +1
+   (eyes looking    (0,0)      (eyes looking
+       left)      eyes centered    right)
+                      │
+                      ↓
+                   y = −1  (eyes looking down)
+```
+
+Magnitude `|gaze| = √(x² + y²)` = how far off-center the pupils are. `0` = centered, `~1` = fully to one side.
+
+### Model + library
+
+| Piece                   | Value                                                                            |
+| ----------------------- | -------------------------------------------------------------------------------- |
+| **Library**             | [`@mediapipe/tasks-vision`](https://www.npmjs.com/package/@mediapipe/tasks-vision) v0.10.34 |
+| **Model**               | `face_landmarker.task` (MediaPipe Face Landmarker v2)                            |
+| **Size**                | ~3.8 MB (float16); ~1 MB WASM runtime                                            |
+| **Source**              | `https://storage.googleapis.com/mediapipe-models/face_landmarker/...`            |
+| **Outputs**             | 478 3D landmarks · 52 ARKit blendshapes · 4×4 head-pose matrix                   |
+| **License**             | Apache 2.0                                                                       |
+| **Runs on**             | Browser (WebGL/WebGPU accelerated; WASM fallback on CPU)                         |
+
+### How we use it
+
+1. `useAttentionTracking` attaches to a module-level singleton `FaceLandmarker` (created once per page lifetime with `outputFaceBlendshapes: true`, `outputFacialTransformationMatrixes: true`, `numFaces: 1`, `runningMode: "VIDEO"`).
+2. Every 250 ms (4 FPS — plenty for an attention indicator) it calls `landmarker.detectForVideo(videoEl, performance.now())`.
+3. `attentionFromResult()` converts the raw output into `{ status, headPose, gaze, eyesClosed }`:
+   - `headPoseFromMatrix` — reads the 3×3 rotation block from the column-major `data[16]`, extracts ZYX-order Euler angles in degrees.
+   - `gazeFromBlendshapes` — combines the four pairs of eye-look scores into a single 2-D vector in `[-1, 1]²`.
+   - `eyesClosedFromBlendshapes` — thresholds the averaged blink scores.
+   - If a baseline is set (see [Calibration](#calibration) below), it's subtracted from head pose and gaze before the thresholds are evaluated.
+4. `AttentionPanel` renders the status pill + three cards (head pose, gaze indicator, eyes state) + a "Recalibrate" button.
+
+**No manual geometry work** — landmark detection, blendshape scoring, and the pose transformation matrix are all produced by MediaPipe. `attention.ts` is just arithmetic on those outputs.
+
+> **Note on the singleton.** The landmarker is stored at module scope (`sharedLandmarker`) rather than per-hook-instance. React StrictMode double-mounts effects in dev; loading per-mount would create a second landmarker and then `close()` the first mid-initialization — that close emits a noisy "Console Error" in the Next.js overlay. A singleton avoids the problem and is fine for a single-page app because only one landmarker is ever needed per tab.
+
+### Calibration
+
+The gaze vector and head-pose angles MediaPipe produces are relative to the user's **head / eye-socket geometry**, not to the camera. `(0, 0, 0°)` means "eyes centered inside your sockets, head perfectly level" — it does **not** mean "looking at the camera." Because the camera is usually above the screen and nobody sits anatomically perfectly, a real user looking directly at the camera might read e.g. `gaze = (-0.14, -0.44), yaw = -4°, pitch = -12°` — already beyond the default thresholds. Without calibration the panel would flag them as "looking-away" permanently.
+
+**The fix — one-shot calibration.** On first load (and again whenever the user clicks **Recalibrate**), the hook records the user's resting `gaze`, `yaw`, and `pitch` for ~1.5 s. It averages those samples into an `AttentionBaseline` and subtracts it from every subsequent reading. After calibration, `(0, 0, 0°)` means "the way you normally sit while looking at the screen."
+
+Flow at runtime:
+
+```
+phase = "calibrating"                        (initial state)
+baseline = null
+   │
+   ├─ First tick with a face present
+   │     → stamp calibrationStart = now
+   │     → push { gaze, headPose } sample
+   │
+   ├─ Each subsequent calibrating tick
+   │     → push sample (if face visible)
+   │
+   ├─ After 1500 ms AND at least 4 samples
+   │     → computeBaseline(samples) = mean of all samples
+   │     → setBaseline(b); setPhase("ready")
+   │
+   └─ phase = "ready"
+         Every tick now applies:
+           headPose.yaw   -= baseline.yaw
+           headPose.pitch -= baseline.pitch
+           gaze.x         -= baseline.gaze.x
+           gaze.y         -= baseline.gaze.y
+         …before decideStatus() thresholds the deviation.
+```
+
+**What doesn't get calibrated.**
+- **Roll** — most users don't tilt their head at rest, and roll doesn't participate in the "looking-away" decision.
+- **Eyes closed** — the blink blendshape is already a relative 0–1 score ("how closed are these eyes"), so an absolute threshold of `0.55` works across users.
+
+**Tuning the calibration**
+
+| Constant                     | Default | Effect of raising it                            |
+| ---------------------------- | ------: | ----------------------------------------------- |
+| `CALIBRATION_MS`             | 1500    | Longer hold required; more stable baseline       |
+| `MIN_CALIBRATION_SAMPLES`    | 4       | Refuses to finalize until N good face frames seen |
+
+Both live in `src/hooks/useAttentionTracking.ts`.
+
+**User-facing UI during calibration**
+- Status pill flips to amber "Calibrating..." with a pulsing dot.
+- Amber banner appears above the cards: *"Calibrating — please look straight at the camera and hold still for a moment."*
+- When the phase flips to `"ready"`, the status pill reverts to the normal on-screen / looking-away / etc. color, and a tiny monospace readout appears at the bottom of the panel: `baseline: gaze=(-0.17, -0.42) · yaw=-4° · pitch=-12°`.
+
+**Recalibrate**
+
+A small "Recalibrate" button next to the status pill re-runs the same flow. Useful when:
+
+- The user moves to a new chair / changes posture.
+- The status pill is obviously wrong (e.g. saying "looking-away" while the user is visibly looking straight ahead).
+- You switch test users during a demo.
+
+It's disabled during the initial load and while a calibration is already in progress, so it can't accidentally double-fire.
+
+**Alternative strategies** we did *not* implement, and why:
+
+| Strategy                     | Pros                                   | Why not here                                                                              |
+| ---------------------------- | -------------------------------------- | ----------------------------------------------------------------------------------------- |
+| Rolling baseline (moving avg)| No explicit calibration step needed    | If the user actually stares off-screen for 30 s, it drifts and starts treating "away" as new normal |
+| Hard-coded per-device offsets| Zero UX friction                       | Can't know camera-vs-screen geometry at build time                                        |
+| Ignore the issue, raise thresholds | Simplest                         | Would mask genuinely small glances that matter for proctoring                             |
+
+### Decision logic
+
+Defaults in `src/lib/attention.ts`:
+
+```ts
+HEAD_AWAY_DEG = 20   // |yaw| or |pitch| above this → looking-away
+GAZE_AWAY     = 0.35 // |gaze| vector magnitude above this → looking-away
+EYES_CLOSED   = 0.55 // averaged blink score ≥ this → eyes-closed
+```
+
+Priority order (top wins):
+
+```
+1.  eyes closed?  ───YES──► status = "eyes-closed"
+                    │
+                    NO
+                    ▼
+2.  |yaw|   > 20° ?  ─┐
+    |pitch| > 20° ?  ─┼─YES──► status = "looking-away"
+    |gaze|  > 0.35?  ─┘
+                    │
+                    NO (all three pass)
+                    ▼
+3.  status = "on-screen"
+```
+
+**Why eyes-closed beats everything else.** If the eyes are shut you literally cannot be looking at the screen, regardless of head angle. Checking it first also prevents single blinks from being mislabeled as "looking-away" when they happen to coincide with a slight head turn.
+
+### The four possible statuses
+
+| Status             | Fires when                                                                         | Practical meaning                                    |
+| ------------------ | ---------------------------------------------------------------------------------- | ---------------------------------------------------- |
+| **`on-screen`**    | Eyes open AND head within ±20° AND gaze magnitude < 0.35                           | User is roughly paying attention                     |
+| **`looking-away`** | Eyes open, but head turned >20° OR pitched >20° OR eyes darting off-center         | User is facing away or glancing elsewhere            |
+| **`eyes-closed`**  | Averaged `eyeBlinkLeft`/`eyeBlinkRight` ≥ 0.55 (priority over everything else)     | Blink, drowsiness, or sleep                          |
+| **`no-face`**      | MediaPipe found no face in this frame                                              | User left the camera view, or the room is too dark   |
+
+### Tuning the thresholds
+
+These are **starting defaults**, not truths. Edit `src/lib/attention.ts`:
+
+| Parameter          | Lower it if…                                                      | Raise it if…                                                                   |
+| ------------------ | ----------------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| `HEAD_AWAY_DEG`    | Users fidget a lot and you want stricter checking                 | You get false "looking-away" from tiny head shifts                             |
+| `GAZE_AWAY`        | You want to catch even small off-screen glances                   | Users sit close to the screen and normal eye saccades keep tripping it          |
+| `EYES_CLOSED`      | You want to flag drowsy half-closed eyes                          | Normal blinks are being counted as "eyes-closed"                               |
+
+### Reality check with numbers
+
+| Situation                                                 | Observed readings                            | Status          |
+| --------------------------------------------------------- | -------------------------------------------- | --------------- |
+| Looking straight at the camera                            | `yaw ≈ 0°, pitch ≈ 0°, gaze ≈ (0.02, 0.05)`  | `on-screen`     |
+| Turning head to check a phone on the desk                 | `yaw ≈ −35°, pitch ≈ −20°`                   | `looking-away`  |
+| Head still, eyes sliding to read a note on the side       | `yaw ≈ 0°, gaze ≈ (0.55, 0)`                 | `looking-away`  |
+| Single blink                                              | avg blink ≈ `0.8` (for ~1 frame)             | `eyes-closed`   |
+| Sustained eyes-shut                                       | avg blink ≈ `0.8` (across many frames)       | `eyes-closed`   |
+
+A single blink and "user fell asleep" look identical per-frame — both fire `eyes-closed`. To tell them apart you'd add a debounce (require N consecutive eye-closed ticks before raising an alarm); that lives in the caller, not in `attention.ts`.
+
+### Alternative: backend-only head pose
+
+If you only need **head pose** (no iris-level gaze) and want it computed on the server you already run, InsightFace can do it natively:
+
+```python
+# python/services/model_registry.py
+allowed_modules=["detection", "recognition", "landmark_3d_68"]
+```
+
+The `1k3d68.onnx` model is already inside every buffalo_l / antelopev2 download — nothing extra to fetch. Each detected face then exposes `face.pose` as a numpy `[pitch, yaw, roll]` in degrees (computed analytically from the 3D landmarks). Cost: roughly 10–20 ms more per request on CPU.
+
+| Dimension              | MediaPipe frontend (this project)              | InsightFace backend option                   |
+| ---------------------- | ---------------------------------------------- | -------------------------------------------- |
+| Runs where             | User's browser                                 | Your server                                  |
+| Needs backend?         | No                                             | Yes                                          |
+| Extra download         | ~5 MB (one time)                               | 0 (already in buffalo_l)                     |
+| Update frequency       | 4 FPS                                          | Per `/api/verify` call (~0.4 FPS)            |
+| Head pose              | Yes (yaw/pitch/roll)                           | Yes (pitch/yaw/roll — order differs)         |
+| Gaze / iris            | **Yes** (blendshapes)                          | No                                           |
+| Eyes open / closed     | **Yes** (blendshapes)                          | No                                           |
+| Cost on server         | None                                           | +10–20 ms/request CPU                        |
+
+You can combine them — MediaPipe on the client for real-time UX, InsightFace on the server for an authoritative check recorded alongside the similarity score. The two are independent.
 
 ---
 
@@ -294,7 +545,7 @@ Both tiers use cosine similarity ≥ 0.4. Change it in:
 
 ### Frontend (browser WASM)
 
-Approximate per-frame times for detect + embed:
+Approximate per-frame times for detect + embed (identity pipeline):
 
 | User's device                  | Detection | Embedding | Total     |
 | ------------------------------ | --------: | --------: | --------: |
@@ -302,6 +553,18 @@ Approximate per-frame times for detect + embed:
 | Older laptop (2018 era)        | ~500 ms   | ~300 ms   | ~800 ms   |
 | Mid-range phone                | ~400 ms   | ~250 ms   | ~650 ms   |
 | Low-end phone                  | ~1000 ms  | ~600 ms   | ~1600 ms  |
+
+Approximate per-frame times for MediaPipe Face Landmarker (attention pipeline):
+
+| User's device                  | Face Landmarker latency | Target FPS |
+| ------------------------------ | ----------------------: | ---------: |
+| Modern laptop (M1/M2, WebGPU)  | ~12–20 ms               | 50–60      |
+| Modern laptop (WASM fallback)  | ~25–35 ms               | 28–35      |
+| Older laptop (2018 era)        | ~50–80 ms               | 12–20      |
+| Mid-range phone                | ~40–60 ms               | 16–25      |
+| Low-end phone                  | ~120–180 ms             | 5–8        |
+
+We cap attention updates at 4 FPS (`TICK_MS = 250` in `useAttentionTracking.ts`), so even on a low-end phone the browser has plenty of idle time between frames.
 
 ### Backend (CPU)
 
@@ -339,6 +602,12 @@ insightface.app.FaceAnalysis(name='antelopev2').prepare(ctx_id=-1, det_size=(640
 **Out of memory.** Both models together use ~2 GB RAM. On a small VPS, remove `antelopev2` from `EAGER_MODELS` in `config.py` or comment out its call in `routers/verify.py`.
 
 **`ModuleNotFoundError: No module named 'insightface'`.** Activate the virtualenv (`source venv/bin/activate`) before running `uvicorn`.
+
+**Console Error: "INFO: Created TensorFlow Lite XNNPACK delegate for CPU." pointing at `useAttentionTracking.ts` line with `landmarker.close()`.** React StrictMode double-mounts effects in dev. Without a singleton, the hook loaded two landmarkers and tried to `close()` the first mid-init, which MediaPipe surfaces via a noisy internal log. Fixed by caching the landmarker at module scope (`sharedLandmarker`) so only one is ever created per tab and `close()` is never called. If you still see this after updating, hard-reload the page (the old bundle may still be running via HMR).
+
+**Attention panel flagged as "looking-away" even when I'm clearly looking at the screen.** Your personal baseline drifted (you moved seats, new posture, different laptop). Click **Recalibrate** in the top-right of the Attention Tracking panel. If that doesn't fix it, raise `HEAD_AWAY_DEG` / `GAZE_AWAY` in `src/lib/attention.ts` — the defaults are tuned for an "aggressive proctoring" feel and may be too strict for casual use.
+
+**Attention panel stays "Calibrating..." forever.** The hook needs at least 4 frames in 1.5 s where a face is detected. If you're in near-darkness, off-camera, or at an extreme angle, MediaPipe can't find the face and the window stretches. Fix the lighting / reposition, or temporarily lower `MIN_CALIBRATION_SAMPLES` in `useAttentionTracking.ts`.
 
 ---
 
@@ -435,6 +704,33 @@ Decoded: **w600k_mbf** = WebFace600K-trained MobileFaceNet with ArcFace loss.
 | w600k_mbf (ours)    | WebFace600K MobileFaceNet  | MobileFaceNet| WebFace600K   | 13 MB   | 99.70% |
 | w600k_r50           | WebFace600K ResNet50       | ResNet-50    | WebFace600K   | ~166 MB | 99.80% |
 | glint360k_r100      | Glint360K ResNet100        | ResNet-100   | Glint360K     | ~248 MB | 99.82% |
+
+### `face_landmarker.task` — attention pipeline (MediaPipe)
+
+| Field        | Value                                                                       |
+| ------------ | --------------------------------------------------------------------------- |
+| Full name    | MediaPipe Face Landmarker v2                                                |
+| What it does | Detects 1 face; outputs 478 3D landmarks + 52 blendshapes + 4×4 pose matrix |
+| Bundle       | `face_landmarker.task` (single file containing multiple sub-models)         |
+| Size         | ~3.8 MB (float16) · ~7 MB (float32)                                         |
+| Input        | Raw `HTMLVideoElement` frame                                                |
+| Output       | `faceLandmarks[]`, `faceBlendshapes[]`, `facialTransformationMatrixes[]`    |
+| Created by   | Google (MediaPipe team)                                                     |
+| License      | Apache 2.0                                                                  |
+| Source       | `https://storage.googleapis.com/mediapipe-models/face_landmarker/...`       |
+
+**Sub-models inside the bundle**
+
+| Sub-model               | Purpose                                                   |
+| ----------------------- | --------------------------------------------------------- |
+| BlazeFace (short-range) | Find face bounding box                                    |
+| Face Mesh v2            | 478 3D landmarks (includes 10 iris points, indices 468–477) |
+| Blendshape head         | 52 ARKit-compatible expression scores (optional)          |
+| Geometry head           | 4×4 head-pose transformation matrix (optional)            |
+
+**Why this is the right pick for attention / gaze**
+
+Unlike SCRFD's 5 landmarks, MediaPipe localizes the iris, and the blendshape head directly produces `eyeLookInLeft`, `eyeLookOutRight`, `eyeBlinkLeft`, etc. — so we don't have to do any geometry ourselves. Head pose comes pre-computed in the transformation matrix; we just decompose it into Euler angles for display.
 
 ### Naming convention
 
@@ -563,6 +859,21 @@ More identities → better generalization. WebFace600K outperforms CASIA-WebFace
 - **InsightFace (Python)** — the toolkit from the team that created ArcFace and SCRFD. Our backend uses it.
 - **face-api.js** — older browser library using dlib ResNet (~2017). ~95 % LFW; no longer maintained.
 - **ONNX Runtime Web** — general-purpose ONNX runner for the browser (via WebAssembly). This project uses it to run SCRFD + MobileFaceNet on the client.
+- **MediaPipe Tasks Vision (`@mediapipe/tasks-vision`)** — Google's on-device ML framework. We use only the `FaceLandmarker` task for head pose + gaze + blendshapes. Apache 2.0, runs via WASM + WebGL/WebGPU, one-file bundle.
+
+**Identity vs attention — which library does what**
+
+| Capability              | InsightFace (backend) | onnxruntime-web + SCRFD/MobileFaceNet (frontend) | MediaPipe Face Landmarker (frontend) |
+| ----------------------- | :-------------------: | :----------------------------------------------: | :----------------------------------: |
+| Face detection          | ✓                     | ✓                                                | ✓ (internal, BlazeFace)              |
+| 5 landmarks             | ✓                     | ✓                                                | ✓ (subset of 478)                    |
+| 478 dense landmarks     | optional module       | ✗                                                | ✓                                    |
+| Iris / pupil position   | ✗                     | ✗                                                | ✓                                    |
+| Face embedding / ID     | ✓                     | ✓                                                | ✗                                    |
+| Head pose (yaw/pitch/roll) | optional module    | ✗                                                | ✓ (transformation matrix)            |
+| 52 blendshape scores    | ✗                     | ✗                                                | ✓                                    |
+
+The three are complementary — pick based on whether you need **identity** (InsightFace / MobileFaceNet) or **attention** (MediaPipe).
 
 ### ONNX
 
@@ -666,6 +977,8 @@ The AI model is the expensive part. Comparing two 512-number vectors is just mul
 | **Alignment**           | Transforming a face so features land at canonical pixel positions. |
 | **ArcFace**             | State-of-the-art face recognition training method (angular margin loss). |
 | **Backbone**            | The main neural network architecture (ResNet50, MobileFaceNet, …). |
+| **BlazeFace**           | Fast face detector used inside MediaPipe. |
+| **Blendshape**          | A 0–1 score for a specific facial expression (ARKit-style). MediaPipe outputs 52. |
 | **Bounding box**        | Rectangle around a detected face (x1, y1, x2, y2). |
 | **CFP-FP**              | Benchmark testing frontal vs profile face recognition. |
 | **Cosine similarity**   | Similarity between two vectors (1 = identical, 0 = unrelated). |
@@ -673,26 +986,38 @@ The AI model is the expensive part. Comparing two 512-number vectors is just mul
 | **Detection**           | Finding where faces are in an image. |
 | **Embedding**           | Fixed-length vector representing a face (face fingerprint). |
 | **Euclidean distance**  | Alternative similarity measure (lower = more similar). |
+| **Euler angles**        | Three angles (yaw, pitch, roll) that describe a 3D rotation. |
 | **face-api.js**         | Older JavaScript face recognition library. |
+| **Face Landmarker**     | MediaPipe's on-device model: 478 landmarks + blendshapes + head-pose matrix. |
 | **FaceNet**             | Google's face recognition model using triplet loss. |
+| **Gaze**                | Where the eyes are looking (as opposed to head direction). |
 | **Glint360K**           | Large training dataset (360K identities). |
+| **Head pose**           | 3-axis orientation of the head: yaw (left/right), pitch (up/down), roll (tilt). |
 | **InsightFace**         | Team/toolkit that created ArcFace and SCRFD. |
-| **Landmark**            | Specific coordinate point on a face (eye, nose, mouth). |
+| **Iris landmarks**      | Coordinate points on the pupils (10 in MediaPipe, indices 468–477). |
+| **`landmark_3d_68`**    | InsightFace module producing 68 3D landmarks + head-pose angles. |
+| **Landmark**            | Specific coordinate point on a face (eye, nose, mouth, …). |
 | **LFW**                 | Labeled Faces in the Wild — the standard benchmark. |
 | **Loss function**       | Mathematical function that guides how a model learns. |
+| **MediaPipe**           | Google's framework for on-device ML tasks (vision, audio, …). |
 | **MobileFaceNet**       | Lightweight face recognition architecture for mobile/edge. |
 | **MTCNN**               | 3-stage face detection model. |
 | **NMS**                 | Non-Maximum Suppression — removes duplicate detections. |
 | **ONNX**                | Open Neural Network Exchange — universal model file format. |
 | **ONNX Runtime**        | Engine that runs ONNX files. |
+| **Pitch**               | Head rotation around the X axis (nodding "yes"). |
 | **Recognition**         | Identifying WHO a face belongs to (by comparing embeddings). |
 | **ResNet**              | Deep neural network architecture with skip connections. |
 | **RetinaFace**          | High-accuracy face detector with landmarks. |
+| **Roll**                | Head rotation around the Z axis (tilting shoulder to shoulder). |
 | **SCRFD**               | Efficient face detector with landmarks (used in this project). |
 | **Similarity transform**| Rotation + scale + translation, used for alignment. |
 | **Softmax**             | Classification training approach. |
+| **Transformation matrix** | 4×4 matrix describing a 3D rotation + translation; head pose in MediaPipe. |
 | **Triplet loss**        | Training method comparing anchor, positive, and negative samples. |
 | **UltraFace**           | Ultra-lightweight face detector (no landmarks). |
 | **VGG-Face**            | Oxford's face recognition model using VGG-16 architecture. |
 | **WASM**                | WebAssembly — near-native code speed in browsers. |
 | **WebFace600K**         | Training dataset with 600K face identities (~10M images). |
+| **WebGPU**              | Modern browser GPU API; enables faster on-device inference. |
+| **Yaw**                 | Head rotation around the Y axis (shaking "no"). |
